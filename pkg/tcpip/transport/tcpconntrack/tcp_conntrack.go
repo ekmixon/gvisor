@@ -49,15 +49,20 @@ const (
 	ResultClosedByOriginator
 )
 
+// maxWindowShift is the maximum shift value of the per the windows scale
+// option defined by RFC 1323.
+const maxWindowShift = 14
+
 // TCB is a TCP Control Block. It holds state necessary to keep track of a TCP
 // connection and inform the caller when the connection has been closed.
 type TCB struct {
 	reply    stream
 	original stream
 
-	// State handlers.
-	handlerReply    func(*TCB, header.TCP) Result
-	handlerOriginal func(*TCB, header.TCP) Result
+	// State handlers. hdr is not guaranteed to contain bytes beyond the TCP
+	// header itself, i.e. it may not contain the payload.
+	handlerReply    func(tcb *TCB, hdr header.TCP, dataLen int) Result
+	handlerOriginal func(tcb *TCB, hdr header.TCP, dataLen int) Result
 
 	// firstFin holds a pointer to the first stream to send a FIN.
 	firstFin *stream
@@ -67,14 +72,18 @@ type TCB struct {
 }
 
 // Init initializes the state of the TCB according to the initial SYN.
-func (t *TCB) Init(initialSyn header.TCP) Result {
+func (t *TCB) Init(initialSyn header.TCP, dataLen int) Result {
 	t.handlerReply = synSentStateReply
 	t.handlerOriginal = synSentStateOriginal
 
 	iss := seqnum.Value(initialSyn.SequenceNumber())
 	t.original.una = iss
-	t.original.nxt = iss.Add(logicalLen(initialSyn))
+	t.original.nxt = iss.Add(logicalLen(initialSyn, dataLen, 1 /* SYN window size */))
 	t.original.end = t.original.nxt
+	// TODO(b/203112125): Cache TCP options instead of re-parsing them.
+	// Because original and reply are streams, scale applies to the reply; it is
+	// the receive window in the reply direction.
+	t.reply.shiftCnt = header.ParseSynOptions(initialSyn.Options(), false /* isAck */).WS
 
 	// Even though "end" is a sequence number, we don't know the initial
 	// receive sequence number yet, so we store the window size until we get
@@ -88,8 +97,8 @@ func (t *TCB) Init(initialSyn header.TCP) Result {
 
 // UpdateStateReply updates the state of the TCB based on the supplied reply
 // segment.
-func (t *TCB) UpdateStateReply(tcp header.TCP) Result {
-	st := t.handlerReply(t, tcp)
+func (t *TCB) UpdateStateReply(tcp header.TCP, dataLen int) Result {
+	st := t.handlerReply(t, tcp, dataLen)
 	if st != ResultDrop {
 		t.state = st
 	}
@@ -98,8 +107,8 @@ func (t *TCB) UpdateStateReply(tcp header.TCP) Result {
 
 // UpdateStateOriginal updates the state of the TCB based on the supplied
 // original segment.
-func (t *TCB) UpdateStateOriginal(tcp header.TCP) Result {
-	st := t.handlerOriginal(t, tcp)
+func (t *TCB) UpdateStateOriginal(tcp header.TCP, dataLen int) Result {
+	st := t.handlerOriginal(t, tcp, dataLen)
 	if st != ResultDrop {
 		t.state = st
 	}
@@ -148,7 +157,7 @@ func (t *TCB) adaptResult(r Result) Result {
 
 // synSentStateReply is the state handler for reply segments when the
 // connection is in SYN-SENT state.
-func synSentStateReply(t *TCB, tcp header.TCP) Result {
+func synSentStateReply(t *TCB, tcp header.TCP, dataLen int) Result {
 	flags := tcp.Flags()
 	ackPresent := flags&header.TCPFlagAck != 0
 	ack := seqnum.Value(tcp.AckNumber())
@@ -174,13 +183,36 @@ func synSentStateReply(t *TCB, tcp header.TCP) Result {
 		return ResultConnecting
 	}
 
+	// TODO(b/203112125): Cache TCP options instead of re-parsing them.
+	// Because original and reply are streams, scale applies to the reply; it is
+	// the receive window in the original direction.
+	t.original.shiftCnt = header.ParseSynOptions(tcp.Options(), ackPresent).WS
+
+	// Window scaling works only when both ends use the scale option.
+	if t.original.shiftCnt != -1 && t.reply.shiftCnt != -1 {
+		// Per RFC 1323 section 2.3:
+		//
+		//  "If a Window Scale option is received with a shift.cnt value exceeding
+		//  14, the TCP should log the error but use 14 instead of the specified
+		//  value."
+		if t.original.shiftCnt > maxWindowShift {
+			t.original.shiftCnt = maxWindowShift
+		}
+		if t.reply.shiftCnt > maxWindowShift {
+			t.original.shiftCnt = maxWindowShift
+		}
+	} else {
+		t.original.shiftCnt = 0
+		t.reply.shiftCnt = 0
+	}
 	// Update state informed by this SYN.
 	irs := seqnum.Value(tcp.SequenceNumber())
 	t.reply.una = irs
-	t.reply.nxt = irs.Add(logicalLen(tcp))
+	t.reply.nxt = irs.Add(logicalLen(tcp, dataLen, seqnum.Size(t.reply.end) /* end currently holds the receive window size */))
+	t.reply.end <<= t.original.shiftCnt
 	t.reply.end += irs
 
-	t.original.end = t.original.una.Add(seqnum.Size(tcp.WindowSize()))
+	t.original.end = t.original.una.Add(seqnum.Size(tcp.WindowSize() << t.reply.shiftCnt))
 
 	// If the ACK was set (it is acceptable), update our unacknowledgement
 	// tracking.
@@ -190,7 +222,7 @@ func synSentStateReply(t *TCB, tcp header.TCP) Result {
 			t.original.una = ack
 		}
 
-		if end := ack.Add(seqnum.Size(tcp.WindowSize())); t.original.end.LessThan(end) {
+		if end := ack.Add(seqnum.Size(tcp.WindowSize() << t.reply.shiftCnt)); t.original.end.LessThan(end) {
 			t.original.end = end
 		}
 	}
@@ -204,10 +236,9 @@ func synSentStateReply(t *TCB, tcp header.TCP) Result {
 
 // synSentStateOriginal is the state handler for original segments when the
 // connection is in SYN-SENT state.
-func synSentStateOriginal(t *TCB, tcp header.TCP) Result {
+func synSentStateOriginal(t *TCB, tcp header.TCP, _ int) Result {
 	// Drop original segments that aren't retransmits of the original one.
-	if tcp.Flags() != header.TCPFlagSyn ||
-		tcp.SequenceNumber() != uint32(t.original.una) {
+	if tcp.Flags() != header.TCPFlagSyn || tcp.SequenceNumber() != uint32(t.original.una) {
 		return ResultDrop
 	}
 
@@ -222,10 +253,10 @@ func synSentStateOriginal(t *TCB, tcp header.TCP) Result {
 // update updates the state of reply and original streams, given the supplied
 // reply segment. For original segments, this same function can be called with
 // swapped reply/original streams.
-func update(tcp header.TCP, reply, original *stream, firstFin **stream) Result {
+func update(tcp header.TCP, reply, original *stream, firstFin **stream, dataLen int) Result {
 	// Ignore segments out of the window.
 	s := seqnum.Value(tcp.SequenceNumber())
-	if !reply.acceptable(s, dataLen(tcp)) {
+	if !reply.acceptable(s, seqnum.Size(dataLen)) {
 		return ResultAlive
 	}
 
@@ -252,12 +283,12 @@ func update(tcp header.TCP, reply, original *stream, firstFin **stream) Result {
 		original.una = ack
 	}
 
-	if end := ack.Add(seqnum.Size(tcp.WindowSize())); original.end.LessThan(end) {
+	if end := ack.Add(seqnum.Size(tcp.WindowSize() << reply.shiftCnt)); original.end.LessThan(end) {
 		original.end = end
 	}
 
 	// Advance the "nxt" index of the reply stream.
-	end := s.Add(logicalLen(tcp))
+	end := s.Add(logicalLen(tcp, dataLen, reply.rwndSize()))
 	if reply.nxt.LessThan(end) {
 		reply.nxt = end
 	}
@@ -278,14 +309,14 @@ func update(tcp header.TCP, reply, original *stream, firstFin **stream) Result {
 
 // allOtherReply is the state handler for reply segments in all states
 // except SYN-SENT.
-func allOtherReply(t *TCB, tcp header.TCP) Result {
-	return t.adaptResult(update(tcp, &t.reply, &t.original, &t.firstFin))
+func allOtherReply(t *TCB, tcp header.TCP, dataLen int) Result {
+	return t.adaptResult(update(tcp, &t.reply, &t.original, &t.firstFin, dataLen))
 }
 
 // allOtherOriginal is the state handler for original segments in all states
 // except SYN-SENT.
-func allOtherOriginal(t *TCB, tcp header.TCP) Result {
-	return t.adaptResult(update(tcp, &t.original, &t.reply, &t.firstFin))
+func allOtherOriginal(t *TCB, tcp header.TCP, dataLen int) Result {
+	return t.adaptResult(update(tcp, &t.original, &t.reply, &t.firstFin, dataLen))
 }
 
 // streams holds the state of a TCP unidirectional stream.
@@ -310,6 +341,11 @@ type stream struct {
 
 	// rstSeen indicates if a RST has already been sent on this stream.
 	rstSeen bool
+
+	// shiftCnt is the shift of the window scale of the receiver of the stream,
+	// i.e. in a stream from A to B it is B's receive window scale. It cannot be
+	// greater than maxWindowScale.
+	shiftCnt int
 }
 
 // acceptable determines if the segment with the given sequence number and data
@@ -326,22 +362,28 @@ func (s *stream) closed() bool {
 	return s.finSeen && s.fin.LessThan(s.una)
 }
 
-// dataLen returns the length of the TCP segment payload.
-func dataLen(tcp header.TCP) seqnum.Size {
-	return seqnum.Size(len(tcp) - int(tcp.DataOffset()))
+// rwndSize returns the stream's receive window size.
+func (s *stream) rwndSize() seqnum.Size {
+	return seqnum.Size(s.end - s.una)
 }
 
 // logicalLen calculates the logical length of the TCP segment.
-func logicalLen(tcp header.TCP) seqnum.Size {
-	l := dataLen(tcp)
+func logicalLen(tcp header.TCP, dataLen int, windowSize seqnum.Size) seqnum.Size {
+	length := seqnum.Size(dataLen)
 	flags := tcp.Flags()
 	if flags&header.TCPFlagSyn != 0 {
-		l++
+		length++
 	}
 	if flags&header.TCPFlagFin != 0 {
-		l++
+		length++
 	}
-	return l
+
+	// If the segment is too large, TCP trims the payload per RFC 793 page 70.
+	if length > windowSize {
+		length = windowSize
+	}
+
+	return length
 }
 
 // IsEmpty returns true if tcb is not initialized.
