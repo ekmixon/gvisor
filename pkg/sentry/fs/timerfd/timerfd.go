@@ -108,8 +108,8 @@ func (t *TimerOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (t *TimerOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
-	t.events.EventRegister(e, mask)
+func (t *TimerOperations) EventRegister(e *waiter.Entry) {
+	t.events.EventRegister(e)
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
@@ -141,12 +141,9 @@ func (t *TimerOperations) Write(context.Context, *fs.File, usermem.IOSequence, i
 	return 0, linuxerr.EINVAL
 }
 
-// Notify implements ktime.TimerListener.Notify.
-func (t *TimerOperations) Notify(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
+// NotifyTimer implements ktime.TimerListener.NotifyTimer.
+func (t *TimerOperations) NotifyTimer(exp uint64, setting ktime.Setting) (ktime.Setting, bool) {
 	atomic.AddUint64(&t.val, exp)
 	t.events.Notify(waiter.ReadableEvents)
 	return ktime.Setting{}, false
 }
-
-// Destroy implements ktime.TimerListener.Destroy.
-func (t *TimerOperations) Destroy() {}
