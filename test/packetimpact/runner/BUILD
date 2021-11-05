@@ -1,4 +1,4 @@
-load("//tools:defs.bzl", "bzl_library", "go_library", "go_test")
+load("//tools:defs.bzl", "bzl_library", "go_binary", "go_library", "go_test")
 
 package(
     default_visibility = ["//test/packetimpact:__subpackages__"],
@@ -34,5 +34,21 @@ go_library(
         "//test/packetimpact/netdevs",
         "//test/packetimpact/testbench",
         "@com_github_docker_docker//api/types/mount:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "main",
+    testonly = 1,
+    srcs = ["main.go"],
+    deps = [
+        "//test/packetimpact/netdevs/netlink",
+        "//test/packetimpact/testbench",
+        "@com_github_google_gopacket//:go_default_library",
+        "@com_github_google_gopacket//layers:go_default_library",
+        "@com_github_google_gopacket//pcapgo:go_default_library",
+        "@com_github_vishvananda_netlink//:go_default_library",
+        "@org_golang_x_sync//errgroup:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
