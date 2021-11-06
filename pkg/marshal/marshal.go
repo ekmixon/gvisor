@@ -132,6 +132,20 @@ type Marshallable interface {
 	CopyOutN(cc CopyContext, addr hostarch.Addr, limit int) (int, error)
 }
 
+// CheckedMarshallable represents operations on a type that can be marshalled
+// to and from memory and additionally does bound checking.
+type CheckedMarshallable interface {
+	// CheckedMarshal is the same as Marshallable.MarshalBytes but without the
+	// precondition that dst must at least have some appropriate length. It
+	// returns a bool indicating whether the marshal was successful.
+	CheckedMarshal(dst []byte) ([]byte, bool)
+
+	// CheckedUnmarshal is the same as Marshallable.UnmarshalBytes but without
+	// the precondition that dst must at least have some appropriate length. It
+	// returns a bool indicating whether the unmarshal was successful.
+	CheckedUnmarshal(src []byte) ([]byte, bool)
+}
+
 // go-marshal generates additional functions for a type based on additional
 // clauses to the +marshal directive. They are documented below.
 //

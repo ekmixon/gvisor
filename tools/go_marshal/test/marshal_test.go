@@ -552,3 +552,22 @@ func TestDynamicTypeIdentifier(t *testing.T) {
 		t.Errorf("dynamic type is not same after marshalling and unmarshalling: before = %s, after = %s", s, res)
 	}
 }
+
+func TestCheckedMethods(t *testing.T) {
+	s := test.Type2{}
+	b := make([]byte, s.SizeBytes())
+
+	if _, ok := s.CheckedMarshal(b[:s.SizeBytes()-1]); ok {
+		t.Errorf("CheckedMarshal should have failed because buffer is small")
+	}
+	if _, ok := s.CheckedMarshal(b); !ok {
+		t.Errorf("CheckedMarshal should have succeeded because buffer size is okay")
+	}
+
+	if _, ok := s.CheckedUnmarshal(b[:s.SizeBytes()-1]); ok {
+		t.Errorf("CheckedUnmarshal should have failed because buffer is small")
+	}
+	if _, ok := s.CheckedUnmarshal(b); !ok {
+		t.Errorf("CheckedUnmarshal should have succeeded because buffer size is okay")
+	}
+}
