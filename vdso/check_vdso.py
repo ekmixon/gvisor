@@ -155,8 +155,8 @@ def CheckData(vdso_path):
     if not line.startswith("  ["):
       continue
 
-    name = m.group("name")
-    size = int(m.group("size"), 16)
+    name = m["name"]
+    size = int(m["size"], 16)
 
     if name == ".text" and size != 0:
       found_text = True
